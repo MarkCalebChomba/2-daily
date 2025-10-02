@@ -256,7 +256,7 @@ class OKXFuturesBot:
         self.email_notifier = EmailNotifier()
         self.session_active = False
         self.session_start_balance = 0
-        self.profit_target_percentage = 0.2
+        self.profit_target_percentage = 500
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
         self.logger = logger
@@ -889,8 +889,7 @@ async def main():
     ║   • 10 Long / 10 Short positions          ║
     ║   • INVERTED indicators (10 total)        ║
     ║   • Bracket orders (SL/TP on exchange)    ║
-    ║   • Rate limiting (5 calls/sec)           ║
-    ║   • Auto-close at 0.2% profit             ║
+    ║   • Rate limiting (5 calls/sec)           ║            
     ║   • Email notifications                   ║
     ║   • CSV session logging with indicators   ║
     ║   • Autonomous server operation           ║
