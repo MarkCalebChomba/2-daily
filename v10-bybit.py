@@ -432,7 +432,7 @@ class BybitFuturesBot:
             self.logger.error(f"Error fetching margin: {e}")
             return 0
 
-    def calculate_equal_position_size(self, symbol: str, price: float, account_balance: float):
+    def calculate_position_size(self, symbol: str, price: float, account_balance: float):
         """USDT-based position sizing - 0.1% of account as margin per trade"""
         try:
             market = self.exchange.market(symbol)
@@ -452,11 +452,13 @@ class BybitFuturesBot:
             amount = math.floor(amount * (10 ** amount_precision)) / (10 ** amount_precision)
             
             if amount < min_amount:
+                self.logger.warning(f"{symbol}: Amount {amount} < min {min_amount}")
                 return 0, 0
             
             # Actual margin used
             actual_margin = (amount * price) / self.leverage
             
+            self.logger.info(f"{symbol}: Amount={amount}, Margin=${actual_margin:.2f}, Value=${position_value_usdt:.2f}")
             return amount, actual_margin
         except Exception as e:
             self.logger.error(f"Size calc error {symbol}: {e}")
@@ -1012,7 +1014,7 @@ class BybitFuturesBot:
                 await asyncio.sleep(10)
 
     async def place_bracket_order(self, trade_info: Dict, amount: float):
-        """Place bracket order with SL/TP - Bybit version"""
+        """Place bracket order with SL at VWAP lower/upper band and TP at 2x risk"""
         symbol = trade_info['symbol']
         direction = trade_info['direction']
         vwap_data = trade_info['vwap_data']
@@ -1028,13 +1030,17 @@ class BybitFuturesBot:
             
             if direction == 'long':
                 side, position_idx = 'buy', 1
-                sl_price = vwap_data['lower_band'] * 0.998
+                # SL at VWAP lower band
+                sl_price = vwap_data['lower_band']
                 risk_distance = entry_price - sl_price
+                # TP at 2x risk distance
                 tp_price = entry_price + (2 * risk_distance)
             else:
                 side, position_idx = 'sell', 2
-                sl_price = vwap_data['upper_band'] * 1.002
+                # SL at VWAP upper band
+                sl_price = vwap_data['upper_band']
                 risk_distance = sl_price - entry_price
+                # TP at 2x risk distance
                 tp_price = entry_price - (2 * risk_distance)
             
             params = {
@@ -1181,17 +1187,19 @@ class BybitFuturesBot:
             
             self.logger.info(f"Selected: {len(selected_longs)} longs, {len(selected_shorts)} shorts")
             
-            available_margin = self.get_available_margin()
+            # Get total account balance for position sizing
             balance_info = self.exchange.fetch_balance()
-            total_account = float(balance_info.get('USDT', {}).get('total', available_margin * 1.25))
+            total_account = float(balance_info.get('USDT', {}).get('total', 0))
             
-            total_margin = available_margin * 0.8
+            if total_account <= 0:
+                self.logger.error("Cannot determine account balance")
+                return
             
             placed = 0
             for trade in selected_longs:
+                # Each trade uses 0.1% of account as margin
                 amount, margin = self.calculate_equal_position_size(
-                    trade['symbol'], trade['vwap_data']['vwap'],
-                    total_margin, total_selected, total_account
+                    trade['symbol'], trade['vwap_data']['vwap'], total_account
                 )
                 if amount > 0:
                     if await self.place_bracket_order(trade, amount):
@@ -1199,9 +1207,9 @@ class BybitFuturesBot:
                     await asyncio.sleep(1)
             
             for trade in selected_shorts:
+                # Each trade uses 0.1% of account as margin
                 amount, margin = self.calculate_equal_position_size(
-                    trade['symbol'], trade['vwap_data']['vwap'],
-                    total_margin, total_selected, total_account
+                    trade['symbol'], trade['vwap_data']['vwap'], total_account
                 )
                 if amount > 0:
                     if await self.place_bracket_order(trade, amount):
