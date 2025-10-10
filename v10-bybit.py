@@ -432,21 +432,19 @@ class BybitFuturesBot:
             self.logger.error(f"Error fetching margin: {e}")
             return 0
 
-    def calculate_equal_position_size(self, symbol: str, price: float, total_margin: float, num_positions: int, account_balance: float):
-        """USDT-based position sizing for Bybit"""
+    def calculate_equal_position_size(self, symbol: str, price: float, account_balance: float):
+        """USDT-based position sizing - 0.1% of account as margin per trade"""
         try:
             market = self.exchange.market(symbol)
             min_amount = float(market.get('limits', {}).get('amount', {}).get('min', 0.01))
             
-            # Calculate USDT per position
-            margin_per_position = total_margin / num_positions
-            max_margin_per_trade = account_balance * 0.1
+            # Use 0.1% of account balance as margin per trade
+            margin_per_trade = account_balance * 0.001
             
-            if margin_per_position > max_margin_per_trade:
-                margin_per_position = max_margin_per_trade
+            # Calculate position value with leverage
+            position_value_usdt = margin_per_trade * self.leverage
             
-            # Direct USDT calculation
-            position_value_usdt = margin_per_position * self.leverage
+            # Calculate amount in base currency
             amount = position_value_usdt / price
             
             # Apply precision
@@ -458,12 +456,6 @@ class BybitFuturesBot:
             
             # Actual margin used
             actual_margin = (amount * price) / self.leverage
-            
-            if actual_margin > max_margin_per_trade:
-                max_position_value = max_margin_per_trade * self.leverage
-                amount = max_position_value / price
-                amount = math.floor(amount * (10 ** amount_precision)) / (10 ** amount_precision)
-                actual_margin = (amount * price) / self.leverage
             
             return amount, actual_margin
         except Exception as e:
@@ -698,11 +690,11 @@ class BybitFuturesBot:
             df_4h = self.fetch_ohlcv(symbol, '4h', 100)
             analysis_4h = self.analyze_symbol(df_4h)
             
-            if analysis_4h['score'] >= 40 and analysis_4h['vwap_data']:
+            if analysis_4h['score'] >= 30 and analysis_4h['vwap_data']:
                 df_15m = self.fetch_ohlcv(symbol, '15m', 100)
                 analysis_15m = self.analyze_symbol(df_15m)
                 
-                if analysis_15m['score'] >= 40 and analysis_15m['vwap_data'] and analysis_4h['direction'] == analysis_15m['direction']:
+                if analysis_15m['score'] >= 15 and analysis_15m['vwap_data'] and analysis_4h['direction'] == analysis_15m['direction']:
                     ticker = self.exchange.fetch_ticker(symbol)
                     
                     trade = {
