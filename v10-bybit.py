@@ -1195,26 +1195,34 @@ class BybitFuturesBot:
                 self.logger.error("Cannot determine account balance")
                 return
             
+            self.logger.info(f"Total account balance: ${total_account:.2f}")
+            
             placed = 0
             for trade in selected_longs:
-                # Each trade uses 0.1% of account as margin
-                amount, margin = self.calculate_equal_position_size(
-                    trade['symbol'], trade['vwap_data']['vwap'], total_account
-                )
-                if amount > 0:
-                    if await self.place_bracket_order(trade, amount):
-                        placed += 1
-                    await asyncio.sleep(1)
+                try:
+                    # Each trade uses 0.1% of account as margin
+                    amount, margin = self.calculate_position_size(
+                        trade['symbol'], trade['vwap_data']['vwap'], total_account
+                    )
+                    if amount > 0:
+                        if await self.place_bracket_order(trade, amount):
+                            placed += 1
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    self.logger.error(f"Failed to place long {trade['symbol']}: {e}")
             
             for trade in selected_shorts:
-                # Each trade uses 0.1% of account as margin
-                amount, margin = self.calculate_equal_position_size(
-                    trade['symbol'], trade['vwap_data']['vwap'], total_account
-                )
-                if amount > 0:
-                    if await self.place_bracket_order(trade, amount):
-                        placed += 1
-                    await asyncio.sleep(1)
+                try:
+                    # Each trade uses 0.1% of account as margin
+                    amount, margin = self.calculate_position_size(
+                        trade['symbol'], trade['vwap_data']['vwap'], total_account
+                    )
+                    if amount > 0:
+                        if await self.place_bracket_order(trade, amount):
+                            placed += 1
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    self.logger.error(f"Failed to place short {trade['symbol']}: {e}")
             
             self.logger.info(f"Placed {placed}/{total_selected} orders")
             
