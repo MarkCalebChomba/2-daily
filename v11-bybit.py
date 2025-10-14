@@ -364,7 +364,8 @@ class BybitFuturesBot:
         self.monitoring_active = False
         self.portfolio_peak_pnl = 0
         self.breakeven_positions = set()
-        self.failed_symbols = set()  # Track symbols that failed to place orders
+        self.failed_symbols = set()
+        self.order_timestamps = {}  # Track when orders were placed
 
     async def rate_limited_call(self, func, *args, **kwargs):
         max_retries = 3
