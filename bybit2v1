@@ -280,52 +280,88 @@ class BybitBot:
             
             long_sig = short_sig = 0
             
-            # RSI
+            # 1. RSI (Inverted: overbought = long, oversold = short)
             rsi = ta.momentum.RSIIndicator(df['close'], 14).rsi().iloc[-1]
             if rsi > 70:
                 long_sig += 1
             elif rsi < 30:
                 short_sig += 1
             
-            # MACD
+            # 2. MACD (Inverted: negative histogram = long)
             macd = ta.trend.MACD(df['close'])
             if macd.macd_diff().iloc[-1] < 0:
                 long_sig += 1
             elif macd.macd_diff().iloc[-1] > 0:
                 short_sig += 1
             
-            # Bollinger
+            # 3. Bollinger Bands (Inverted: above upper = long)
             bb = ta.volatility.BollingerBands(df['close'], 20, 2)
             if price > bb.bollinger_hband().iloc[-1]:
                 long_sig += 1
             elif price < bb.bollinger_lband().iloc[-1]:
                 short_sig += 1
             
-            # Stochastic
+            # 4. Stochastic (Inverted: overbought = long)
             stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'], 14, 3)
             if stoch.stoch().iloc[-1] > 80:
                 long_sig += 1
             elif stoch.stoch().iloc[-1] < 20:
                 short_sig += 1
             
-            # VWAP position
+            # 5. VWAP (Inverted: above = long)
             if price > vwap_data['vwap']:
                 long_sig += 1
             else:
                 short_sig += 1
             
-            # EMA
+            # 6. EMA 20 (Inverted: above = long)
             ema = ta.trend.EMAIndicator(df['close'], 20).ema_indicator().iloc[-1]
             if price > ema:
                 long_sig += 1
             elif price < ema:
                 short_sig += 1
             
+            # 7. ADX (Trend strength + direction)
+            adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14)
+            if not adx.adx().isna().all() and adx.adx().iloc[-1] > 25:
+                if price > df['close'].iloc[-10]:
+                    long_sig += 1
+                elif price < df['close'].iloc[-10]:
+                    short_sig += 1
+            
+            # 8. Williams %R (Inverted: overbought = long)
+            williams = ta.momentum.WilliamsRIndicator(df['high'], df['low'], df['close'], 14)
+            if not williams.williams_r().isna().all():
+                wr = williams.williams_r().iloc[-1]
+                if wr > -20:
+                    long_sig += 1
+                elif wr < -80:
+                    short_sig += 1
+            
+            # 9. CCI (Inverted: overbought = long)
+            cci = ta.trend.CCIIndicator(df['high'], df['low'], df['close'], 20)
+            if not cci.cci().isna().all():
+                cci_val = cci.cci().iloc[-1]
+                if cci_val > 100:
+                    long_sig += 1
+                elif cci_val < -100:
+                    short_sig += 1
+            
+            # 10. MFI (Inverted: overbought = long)
+            mfi = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume'], 14)
+            if not mfi.money_flow_index().isna().all():
+                mfi_val = mfi.money_flow_index().iloc[-1]
+                if mfi_val > 80:
+                    long_sig += 1
+                elif mfi_val < 20:
+                    short_sig += 1
+            
             score = max(long_sig, short_sig) * 10
             direction = 'long' if long_sig > short_sig else ('short' if short_sig > long_sig else 'neutral')
             
             return {'score': score, 'direction': direction, 'vwap_data': vwap_data}
-        except:
+        except Exception as e:
+            logger.error(f"Analysis error: {e}")
             return {'score': 0, 'direction': 'neutral', 'vwap_data': None}
     
     def find_opportunities(self, symbols):
