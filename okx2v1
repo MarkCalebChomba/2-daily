@@ -1,0 +1,1346 @@
+import ccxt
+import pandas as pd
+import numpy as np
+import math
+import ta
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional
+import warnings
+import csv
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import io
+
+warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('OKXFuturesBot')
+
+class EmailReporter:
+    def __init__(self, sender_email="markcalebchomba@gmail.com", 
+                 receiver_email="achiverscollege6@gmail.com",
+                 password="leug erco myri ncxv",
+                 smtp_server="smtp.gmail.com",
+                 smtp_port=587):
+        self.sender_email = sender_email
+        self.receiver = receiver_email
+        self.password = password
+        self.smtp_server = smtp_server
+        self.smtp_port = smtp_port
+        self.last_email_time = datetime.now() - timedelta(hours=24)
+        self.last_report_time = datetime.now() - timedelta(hours=12)
+        self.logger = logger
+    
+    def send_session_report(self, csv_content: str, session_summary: Dict):
+        """Send session report via email with CSV attachment"""
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.sender_email
+            msg['To'] = self.receiver
+            msg['Subject'] = f"OKX Trading Session Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            
+            # Email body
+            body = f"""
+OKX Futures Trading Session Report
+{'=' * 50}
+
+Session Summary:
+- Start Time: {session_summary['start_time']}
+- End Time: {session_summary['end_time']}
+- Duration: {session_summary['duration_minutes']:.1f} minutes
+- Reason: {session_summary['reason']}
+
+Performance:
+- Start Balance: ${session_summary['start_balance']:.2f}
+- End Balance: ${session_summary['end_balance']:.2f}
+- Session PnL: ${session_summary['pnl']:.2f} ({session_summary['pnl_percentage']:.2f}%)
+
+Trading Statistics:
+- Total Trades: {session_summary['total_trades']}
+- Trades Won: {session_summary['trades_won']}
+- Trades Lost: {session_summary['trades_lost']}
+- Win Rate: {session_summary['win_rate']:.1f}%
+
+Risk Metrics:
+- Max Drawdown: {session_summary['max_drawdown']:.2f}%
+- Peak Balance: ${session_summary['peak_balance']:.2f}
+- Final Drawdown: {session_summary['final_drawdown']:.2f}%
+
+{'=' * 50}
+This is an automated report from your OKX Futures Trading Bot.
+"""
+            
+            msg.attach(MIMEText(body, 'plain'))
+            
+            # Attach CSV
+            csv_attachment = MIMEBase('application', 'octet-stream')
+            csv_attachment.set_payload(csv_content.encode('utf-8'))
+            encoders.encode_base64(csv_attachment)
+            csv_attachment.add_header(
+                'Content-Disposition',
+                f'attachment; filename=okx_session_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            )
+            msg.attach(csv_attachment)
+            
+            # Send email
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.sender_email, self.password)
+                server.send_message(msg)
+            
+            self.logger.info(f"Session report sent successfully to {self.receiver}")
+            self.last_email_time = datetime.now()
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send email report: {e}")
+            return False
+    
+    def send_periodic_report(self, bot_instance):
+        """Send periodic status report every 12 hours"""
+        try:
+            current_time = datetime.now()
+            
+            # Check if 12 hours passed
+            if current_time - self.last_report_time < timedelta(hours=12):
+                return False
+            
+            balance = bot_instance.get_available_margin()
+            positions = bot_instance.exchange.fetch_positions()
+            open_orders = bot_instance.exchange.fetch_open_orders()
+            
+            active_longs = 0
+            active_shorts = 0
+            long_symbols = []
+            short_symbols = []
+            total_pnl = 0
+            
+            for pos in positions:
+                if pos.get('contracts', 0) > 0:
+                    if pos['side'] == 'long':
+                        active_longs += 1
+                        long_symbols.append(f"{pos['symbol']}(${pos.get('unrealizedPnl', 0):.2f})")
+                    else:
+                        active_shorts += 1
+                        short_symbols.append(f"{pos['symbol']}(${pos.get('unrealizedPnl', 0):.2f})")
+                    total_pnl += pos.get('unrealizedPnl', 0)
+            
+            pending_entry_orders = len([o for o in open_orders if not o.get('reduceOnly', False)])
+            
+            msg = MIMEMultipart()
+            msg['From'] = self.sender_email
+            msg['To'] = self.receiver
+            msg['Subject'] = f"OKX Bot - 12hr Status Report - {current_time.strftime('%Y-%m-%d %H:%M')}"
+            
+            body = f"""
+OKX Futures Bot - 12 Hour Status Report
+{'=' * 50}
+
+Account Status:
+- Current Balance: ${balance:.2f}
+- Session Start Balance: ${bot_instance.session_start_balance:.2f}
+- Session PnL: ${balance - bot_instance.session_start_balance:.2f}
+- Unrealized PnL: ${total_pnl:.2f}
+
+Position Summary:
+- Active Long Positions: {active_longs}/10
+- Active Short Positions: {active_shorts}/10
+- Pending Entry Orders: {pending_entry_orders}
+- Total Exposure: {active_longs + active_shorts + pending_entry_orders}/20
+
+Long Positions:
+{chr(10).join(long_symbols) if long_symbols else 'None'}
+
+Short Positions:
+{chr(10).join(short_symbols) if short_symbols else 'None'}
+
+Session Info:
+- Session Started: {bot_instance.session_tracker.session_start_time.strftime('%Y-%m-%d %H:%M:%S')}
+- Session Duration: {(current_time - bot_instance.session_tracker.session_start_time).total_seconds() / 3600:.1f} hours
+- Trades This Session: {bot_instance.session_tracker.total_trades}
+- Win Rate: {(bot_instance.session_tracker.trades_won / bot_instance.session_tracker.total_trades * 100) if bot_instance.session_tracker.total_trades > 0 else 0:.1f}%
+
+{'=' * 50}
+This is an automated 12-hour status report.
+Next report in 12 hours.
+"""
+            
+            msg.attach(MIMEText(body, 'plain'))
+            
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.sender_email, self.password)
+                server.send_message(msg)
+            
+            self.logger.info("12-hour periodic report sent successfully")
+            self.last_report_time = current_time
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send periodic report: {e}")
+            return False
+    
+    def send_error_report(self, error_message: str, traceback_info: str):
+        """Send error notification email"""
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.sender_email
+            msg['To'] = self.receiver
+            msg['Subject'] = f"OKX Bot ERROR - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            
+            body = f"""
+OKX Futures Bot - ERROR NOTIFICATION
+{'=' * 50}
+
+An error occurred in the trading bot:
+
+Error Message:
+{error_message}
+
+Traceback:
+{traceback_info}
+
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{'=' * 50}
+Please check the bot immediately.
+"""
+            
+            msg.attach(MIMEText(body, 'plain'))
+            
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.sender_email, self.password)
+                server.send_message(msg)
+            
+            self.logger.info("Error report sent successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send error report: {e}")
+            return False
+
+class TechnicalIndicators:
+    @staticmethod
+    def calculate_rsi(close, period=14):
+        return ta.momentum.RSIIndicator(close=close, window=period).rsi()
+    
+    @staticmethod
+    def calculate_macd(close):
+        macd_indicator = ta.trend.MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
+        return macd_indicator.macd(), macd_indicator.macd_signal(), macd_indicator.macd_diff()
+    
+    @staticmethod
+    def calculate_bollinger_bands(close, period=20, std_dev=2):
+        bb_indicator = ta.volatility.BollingerBands(close=close, window=period, window_dev=std_dev)
+        return bb_indicator.bollinger_hband(), bb_indicator.bollinger_mavg(), bb_indicator.bollinger_lband()
+    
+    @staticmethod
+    def calculate_stochastic(high, low, close, k_period=14, d_period=3):
+        stoch_indicator = ta.momentum.StochasticOscillator(high=high, low=low, close=close, window=k_period, smooth_window=d_period)
+        return stoch_indicator.stoch(), stoch_indicator.stoch_signal()
+    
+    @staticmethod
+    def calculate_vwap_with_bands(high, low, close, volume, period=20, std_dev=2):
+        """Calculate VWAP with standard deviation bands"""
+        try:
+            typical_price = (high + low + close) / 3
+            tpv = typical_price * volume
+            
+            vwap = tpv.rolling(window=period).sum() / volume.rolling(window=period).sum()
+            
+            price_diff = typical_price - vwap
+            variance = (price_diff ** 2).rolling(window=period).mean()
+            std = np.sqrt(variance)
+            
+            upper_band_2sigma = vwap + (std_dev * std)
+            lower_band_2sigma = vwap - (std_dev * std)
+            
+            return vwap, upper_band_2sigma, lower_band_2sigma, std
+            
+        except Exception as e:
+            typical_price = (high + low + close) / 3
+            cumulative_tpv = (typical_price * volume).cumsum()
+            cumulative_volume = volume.cumsum()
+            vwap = cumulative_tpv / cumulative_volume
+            
+            rolling_std = typical_price.rolling(window=period).std()
+            upper_band_2sigma = vwap + (std_dev * rolling_std)
+            lower_band_2sigma = vwap - (std_dev * rolling_std)
+            
+            return vwap, upper_band_2sigma, lower_band_2sigma, rolling_std
+    
+    @staticmethod
+    def calculate_ema(close, period=20):
+        return ta.trend.EMAIndicator(close=close, window=period).ema_indicator()
+    
+    @staticmethod
+    def calculate_adx(high, low, close, period=14):
+        return ta.trend.ADXIndicator(high=high, low=low, close=close, window=period).adx()
+    
+    @staticmethod
+    def calculate_williams_r(high, low, close, period=14):
+        return ta.momentum.WilliamsRIndicator(high=high, low=low, close=close, lbp=period).williams_r()
+    
+    @staticmethod
+    def calculate_cci(high, low, close, period=20):
+        return ta.trend.CCIIndicator(high=high, low=low, close=close, window=period).cci()
+    
+    @staticmethod
+    def calculate_mfi(high, low, close, volume, period=14):
+        return ta.volume.MFIIndicator(high=high, low=low, close=close, volume=volume, window=period).money_flow_index()
+
+class SessionTracker:
+    def __init__(self, email_reporter: EmailReporter):
+        self.email_reporter = email_reporter
+        self.session_start_time = datetime.now()
+        self.session_start_balance = 0
+        self.trades_data = []
+        self.peak_balance = 0
+        self.current_drawdown = 0
+        self.max_drawdown = 0
+        self.trades_won = 0
+        self.trades_lost = 0
+        self.total_trades = 0
+    
+    def start_session(self, initial_balance):
+        self.session_start_time = datetime.now()
+        self.session_start_balance = initial_balance
+        self.peak_balance = initial_balance
+        self.trades_data = []
+        self.current_drawdown = 0
+        self.max_drawdown = 0
+        self.trades_won = 0
+        self.trades_lost = 0
+        self.total_trades = 0
+        logger.info(f"New session started with balance: ${initial_balance:.2f}")
+    
+    def update_balance(self, current_balance):
+        if current_balance > self.peak_balance:
+            self.peak_balance = current_balance
+            self.current_drawdown = 0
+        else:
+            self.current_drawdown = ((self.peak_balance - current_balance) / self.peak_balance) * 100
+            if self.current_drawdown > self.max_drawdown:
+                self.max_drawdown = self.current_drawdown
+    
+    def add_trade(self, symbol, direction, entry_price, exit_price, pnl, pnl_percentage, status):
+        trade_data = {
+            'symbol': symbol,
+            'direction': direction,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'pnl': pnl,
+            'pnl_percentage': pnl_percentage,
+            'status': status,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        self.trades_data.append(trade_data)
+        self.total_trades += 1
+        
+        if status == 'won':
+            self.trades_won += 1
+        elif status == 'lost':
+            self.trades_lost += 1
+    
+    def end_session(self, final_balance, reason="manual_close"):
+        session_end_time = datetime.now()
+        session_duration = (session_end_time - self.session_start_time).total_seconds() / 60
+        
+        session_pnl = final_balance - self.session_start_balance
+        session_pnl_percentage = (session_pnl / self.session_start_balance) * 100 if self.session_start_balance > 0 else 0
+        
+        win_rate = (self.trades_won / self.total_trades) * 100 if self.total_trades > 0 else 0
+        final_drawdown = ((self.peak_balance - final_balance) / self.peak_balance) * 100 if self.peak_balance > 0 else 0
+        
+        # Create CSV in memory
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        
+        # Write headers
+        writer.writerow([
+            'session_start', 'session_end', 'session_duration_minutes',
+            'start_balance', 'end_balance', 'session_pnl', 'session_pnl_percentage',
+            'trades_total', 'trades_won', 'trades_lost', 'win_rate_percentage',
+            'max_drawdown_percentage', 'peak_balance', 'final_drawdown_percentage'
+        ])
+        
+        # Write session data
+        writer.writerow([
+            self.session_start_time.isoformat(),
+            session_end_time.isoformat(),
+            round(session_duration, 2),
+            self.session_start_balance,
+            final_balance,
+            session_pnl,
+            round(session_pnl_percentage, 2),
+            self.total_trades,
+            self.trades_won,
+            self.trades_lost,
+            round(win_rate, 2),
+            round(self.max_drawdown, 2),
+            self.peak_balance,
+            round(final_drawdown, 2)
+        ])
+        
+        # Write blank line
+        writer.writerow([])
+        
+        # Write trades header
+        writer.writerow(['Trade Details:'])
+        writer.writerow(['symbol', 'direction', 'entry_price', 'exit_price', 'pnl', 'pnl_percentage', 'status', 'timestamp'])
+        
+        # Write trades
+        for trade in self.trades_data:
+            writer.writerow([
+                trade['symbol'],
+                trade['direction'],
+                trade['entry_price'],
+                trade['exit_price'],
+                trade['pnl'],
+                trade['pnl_percentage'],
+                trade['status'],
+                trade['timestamp']
+            ])
+        
+        csv_content = csv_buffer.getvalue()
+        csv_buffer.close()
+        
+        # Prepare summary for email
+        session_summary = {
+            'start_time': self.session_start_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'end_time': session_end_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'duration_minutes': session_duration,
+            'reason': reason,
+            'start_balance': self.session_start_balance,
+            'end_balance': final_balance,
+            'pnl': session_pnl,
+            'pnl_percentage': session_pnl_percentage,
+            'total_trades': self.total_trades,
+            'trades_won': self.trades_won,
+            'trades_lost': self.trades_lost,
+            'win_rate': win_rate,
+            'max_drawdown': self.max_drawdown,
+            'peak_balance': self.peak_balance,
+            'final_drawdown': final_drawdown
+        }
+        
+        # Send email
+        self.email_reporter.send_session_report(csv_content, session_summary)
+        
+        logger.info(f"Session ended - Reason: {reason}")
+        logger.info(f"Duration: {session_duration:.1f} minutes")
+        logger.info(f"PnL: ${session_pnl:.2f} ({session_pnl_percentage:.2f}%)")
+        logger.info(f"Trades: {self.total_trades} (Won: {self.trades_won}, Lost: {self.trades_lost})")
+        logger.info(f"Win Rate: {win_rate:.1f}%")
+        logger.info(f"Max Drawdown: {self.max_drawdown:.2f}%")
+
+class OKXFuturesBot:
+    def __init__(self, api_key: str, api_secret: str, passphrase: str, email_reporter: EmailReporter, test_mode: bool = False):
+        self.exchange = ccxt.okx({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'password': passphrase,
+            'sandbox': test_mode,
+            'enableRateLimit': True,
+        })
+        
+        self.indicators = TechnicalIndicators()
+        self.positions = {}
+        self.leverage = 20
+        self.max_total_positions = 20
+        self.max_long_positions = 10
+        self.max_short_positions = 10
+        self.order_reset_time = datetime.now()
+        self.logger = logger
+        self.email_reporter = email_reporter
+        
+        self.session_tracker = SessionTracker(email_reporter)
+        self.session_active = False
+        self.session_start_balance = 0
+        self.position_history = {}
+    
+    
+    
+    async def ensure_tp_sl_for_position(self, position):
+        """Ensure TP/SL orders exist for a position, add if missing"""
+        try:
+            symbol = position['symbol']
+            side = position['side']
+            entry_price = position.get('entryPrice', 0)
+            size = position.get('contracts', 0)
+            
+            if entry_price == 0 or size == 0:
+                return
+            
+            # Check for existing TP/SL orders
+            open_orders = self.exchange.fetch_open_orders(symbol)
+            has_tp = False
+            has_sl = False
+            
+            for order in open_orders:
+                if order.get('reduceOnly'):
+                    order_type = order.get('type', '').lower()
+                    if 'take_profit' in order_type or order.get('stopPrice'):
+                        if side == 'long' and order['side'] == 'sell':
+                            has_tp = True
+                        elif side == 'short' and order['side'] == 'buy':
+                            has_tp = True
+                    if 'stop_loss' in order_type or 'stop' in order_type:
+                        if side == 'long' and order['side'] == 'sell':
+                            has_sl = True
+                        elif side == 'short' and order['side'] == 'buy':
+                            has_sl = True
+            
+            # Add missing TP/SL
+            if not has_tp or not has_sl:
+                self.logger.info(f"Adding missing TP/SL for {symbol} {side}")
+                
+                # Calculate TP/SL prices based on VWAP deviation (2% default)
+                risk_pct = 0.02
+                
+                if side == 'long':
+                    sl_price = entry_price * (1 - risk_pct)
+                    tp_price = entry_price * (1 + (risk_pct * 2))
+                    close_side = 'sell'
+                else:
+                    sl_price = entry_price * (1 + risk_pct)
+                    tp_price = entry_price * (1 - (risk_pct * 2))
+                    close_side = 'buy'
+                
+                # Place TP order if missing
+                if not has_tp:
+                    try:
+                        tp_order = self.exchange.create_order(
+                            symbol=symbol,
+                            type='limit',
+                            side=close_side,
+                            amount=size,
+                            price=tp_price,
+                            params={
+                                'posSide': side,
+                                'tdMode': 'cross',
+                                'reduceOnly': True
+                            }
+                        )
+                        self.logger.info(f"Added TP for {symbol} at ${tp_price:.6f}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to add TP for {symbol}: {e}")
+                
+                # Place SL order if missing
+                if not has_sl:
+                    try:
+                        sl_order = self.exchange.create_order(
+                            symbol=symbol,
+                            type='stop_market',
+                            side=close_side,
+                            amount=size,
+                            params={
+                                'posSide': side,
+                                'tdMode': 'cross',
+                                'stopPrice': sl_price,
+                                'reduceOnly': True
+                            }
+                        )
+                        self.logger.info(f"Added SL for {symbol} at ${sl_price:.6f}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to add SL for {symbol}: {e}")
+        
+        except Exception as e:
+            self.logger.error(f"Error ensuring TP/SL for position: {e}")
+    
+    async def cancel_entry_orders_only(self):
+        """Cancel only entry orders, preserve TP/SL orders for existing positions"""
+        try:
+            # Get all positions first
+            positions = self.exchange.fetch_positions()
+            position_symbols = set()
+            
+            for pos in positions:
+                if pos.get('contracts', 0) > 0:
+                    position_symbols.add(pos['symbol'])
+            
+            # Get all open orders
+            open_orders = self.exchange.fetch_open_orders()
+            cancelled_count = 0
+            
+            for order in open_orders:
+                if order['status'] == 'open':
+                    symbol = order['symbol']
+                    is_reduce_only = order.get('reduceOnly', False)
+                    
+                    # If this order is for an existing position and is reduce-only, skip it (it's TP/SL)
+                    if symbol in position_symbols and is_reduce_only:
+                        self.logger.info(f"Preserving TP/SL order for {symbol}")
+                        continue
+                    
+                    # Cancel entry orders (non-reduce-only or for symbols without positions)
+                    try:
+                        self.exchange.cancel_order(order['id'], symbol)
+                        cancelled_count += 1
+                        self.logger.info(f"Cancelled entry order: {symbol} {order['side']}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to cancel order {order['id']}: {e}")
+            
+            if cancelled_count > 0:
+                self.logger.info(f"Cancelled {cancelled_count} entry orders (preserved TP/SL)")
+            
+            # Ensure all positions have TP/SL
+            for pos in positions:
+                if pos.get('contracts', 0) > 0:
+                    await self.ensure_tp_sl_for_position(pos)
+            
+        except Exception as e:
+            self.logger.error(f"Error cancelling entry orders: {e}")
+    
+    async def close_all_positions_and_orders(self, reason="profit_target"):
+        try:
+            self.logger.info(f"Closing all positions and orders - Reason: {reason}")
+            
+            # Cancel all open orders
+            open_orders = self.exchange.fetch_open_orders()
+            cancelled_count = 0
+            
+            for order in open_orders:
+                if order['status'] == 'open':
+                    try:
+                        self.exchange.cancel_order(order['id'], order['symbol'])
+                        cancelled_count += 1
+                        self.logger.info(f"Cancelled order: {order['symbol']} {order['side']}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to cancel order {order['id']}: {e}")
+            
+            # Close all positions at market price
+            positions = self.exchange.fetch_positions()
+            closed_count = 0
+            
+            for pos in positions:
+                if pos.get('contracts', 0) > 0:
+                    symbol = pos['symbol']
+                    size = pos['contracts']
+                    side = 'sell' if pos['side'] == 'long' else 'buy'
+                    
+                    try:
+                        close_order = self.exchange.create_order(
+                            symbol=symbol,
+                            type='market',
+                            side=side,
+                            amount=size,
+                            params={'posSide': pos['side'], 'tdMode': 'cross', 'reduceOnly': True}
+                        )
+                        
+                        closed_count += 1
+                        
+                        current_price = self.exchange.fetch_ticker(symbol)['last']
+                        entry_price = pos.get('entryPrice', 0)
+                        pnl = pos.get('unrealizedPnl', 0)
+                        
+                        if entry_price > 0:
+                            if pos['side'] == 'long':
+                                pnl_percentage = ((current_price - entry_price) / entry_price) * 100
+                            else:
+                                pnl_percentage = ((entry_price - current_price) / entry_price) * 100
+                        else:
+                            pnl_percentage = 0
+                        
+                        status = 'won' if pnl > 0 else ('lost' if pnl < 0 else 'breakeven')
+                        
+                        self.session_tracker.add_trade(
+                            symbol=symbol,
+                            direction=pos['side'],
+                            entry_price=entry_price,
+                            exit_price=current_price,
+                            pnl=pnl,
+                            pnl_percentage=pnl_percentage,
+                            status=status
+                        )
+                        
+                        self.logger.info(f"Closed position: {symbol} {pos['side']} - PnL: ${pnl:.2f} ({pnl_percentage:.2f}%)")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to close position {symbol}: {e}")
+            
+            self.logger.info(f"Session cleanup complete - Cancelled {cancelled_count} orders, Closed {closed_count} positions")
+            self.positions.clear()
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error closing all positions: {e}")
+            return False
+    
+    def start_new_session(self, initial_balance):
+        self.session_start_balance = initial_balance
+        self.session_active = True
+        self.session_tracker.start_session(initial_balance)
+        self.order_reset_time = datetime.now()
+    
+    def get_available_margin(self):
+        try:
+            balance = self.exchange.fetch_balance()
+            return balance['USDT']['free'] if 'USDT' in balance else 0
+        except Exception as e:
+            self.logger.error(f"Error fetching margin: {e}")
+            return 0
+    
+    def calculate_equal_position_size(self, symbol: str, price: float, total_margin: float, num_positions: int, account_balance: float):
+        try:
+            market = self.exchange.market(symbol)
+            contract_size = market.get('contractSize', 1)
+            min_amount = market.get('limits', {}).get('amount', {}).get('min', 1)
+            
+            margin_per_position = total_margin / num_positions
+            max_margin_per_trade = account_balance * 0.1
+            
+            if margin_per_position > max_margin_per_trade:
+                self.logger.warning(f"Trade margin ${margin_per_position:.2f} exceeds 10% limit (${max_margin_per_trade:.2f}) for {symbol}")
+                margin_per_position = max_margin_per_trade
+                self.logger.info(f"Adjusted to 10% limit: ${margin_per_position:.2f}")
+            
+            position_value = margin_per_position * self.leverage
+            raw_amount = (position_value / (price * contract_size)) / (self.leverage / 2)
+            
+            amount_precision = market.get('precision', {}).get('amount', 0)
+            if amount_precision > 0:
+                amount = math.floor(raw_amount * (10 ** amount_precision)) / (10 ** amount_precision)
+            else:
+                amount = math.floor(raw_amount)
+            
+            if amount < min_amount:
+                return 0, 0
+            
+            actual_margin = (amount * price * contract_size) / self.leverage
+            
+            if actual_margin > max_margin_per_trade:
+                max_position_value = max_margin_per_trade * self.leverage
+                recalc_amount = (max_position_value / (price * contract_size)) / (self.leverage / 2)
+                
+                if amount_precision > 0:
+                    amount = math.floor(recalc_amount * (10 ** amount_precision)) / (10 ** amount_precision)
+                else:
+                    amount = math.floor(recalc_amount)
+                
+                actual_margin = (amount * price * contract_size) / self.leverage
+                self.logger.info(f"Recalculated {symbol}: amount={amount}, margin=${actual_margin:.2f}")
+            
+            account_risk_pct = (actual_margin / account_balance) * 100
+            self.logger.info(f"{symbol}: ${actual_margin:.2f} margin ({account_risk_pct:.2f}% of account)")
+            
+            return amount, actual_margin
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating position size for {symbol}: {e}")
+            return 0, 0
+    
+    def get_futures_symbols(self):
+        try:
+            markets = self.exchange.load_markets()
+            futures_with_volume = []
+            
+            for symbol, market in markets.items():
+                if market.get('swap') and market.get('quote') == 'USDT':
+                    try:
+                        ticker = self.exchange.fetch_ticker(symbol)
+                        if ticker.get('baseVolume'):
+                            market['volume'] = ticker['baseVolume']
+                            market['last'] = ticker['last']
+                            futures_with_volume.append(market)
+                    except:
+                        continue
+            
+            futures_with_volume.sort(key=lambda x: x.get('volume', 0), reverse=True)
+            return futures_with_volume[:100]
+        except Exception as e:
+            self.logger.error(f"Error fetching futures: {e}")
+            return []
+    
+    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 200):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            if not ohlcv:
+                return pd.DataFrame()
+                
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df
+        except Exception as e:
+            self.logger.error(f"Error fetching data for {symbol}: {e}")
+            return pd.DataFrame()
+    
+    def analyze_symbol(self, df: pd.DataFrame) -> Dict:
+        if df.empty or len(df) < 50:
+            return {'score': 0, 'direction': 'neutral', 'vwap_data': None}
+        
+        long_signals = 0
+        short_signals = 0
+        
+        try:
+            vwap, upper_band, lower_band, std = self.indicators.calculate_vwap_with_bands(
+                df['high'], df['low'], df['close'], df['volume']
+            )
+            
+            if vwap.isna().all():
+                return {'score': 0, 'direction': 'neutral', 'vwap_data': None}
+            
+            current_vwap = vwap.iloc[-1]
+            current_upper = upper_band.iloc[-1]
+            current_lower = lower_band.iloc[-1]
+            current_price = df['close'].iloc[-1]
+            
+            vwap_data = {
+                'vwap': current_vwap,
+                'upper_band': current_upper,
+                'lower_band': current_lower,
+                'std': std.iloc[-1] if not std.isna().all() else None
+            }
+            
+            rsi = self.indicators.calculate_rsi(df['close'])
+            if rsi.iloc[-1] > 70:
+                long_signals += 1
+            elif rsi.iloc[-1] < 30:
+                short_signals += 1
+            
+            macd, signal, hist = self.indicators.calculate_macd(df['close'])
+            if hist.iloc[-1] < 0:
+                long_signals += 1
+            elif hist.iloc[-1] > 0:
+                short_signals += 1
+            
+            bb_upper, bb_middle, bb_lower = self.indicators.calculate_bollinger_bands(df['close'])
+            if current_price > bb_upper.iloc[-1]:
+                long_signals += 1
+            elif current_price < bb_lower.iloc[-1]:
+                short_signals += 1
+            
+            k, d = self.indicators.calculate_stochastic(df['high'], df['low'], df['close'])
+            if k.iloc[-1] > 80:
+                long_signals += 1
+            elif k.iloc[-1] < 20:
+                short_signals += 1
+            
+            if current_price > current_vwap:
+                long_signals += 1
+            else:
+                short_signals += 1
+            
+            ema = self.indicators.calculate_ema(df['close'])
+            if current_price > ema.iloc[-1]:
+                long_signals += 1
+            elif current_price < ema.iloc[-1]:
+                short_signals += 1
+            
+            adx = self.indicators.calculate_adx(df['high'], df['low'], df['close'])
+            if not adx.isna().all() and adx.iloc[-1] > 25:
+                if current_price > df['close'].iloc[-10]:
+                    long_signals += 1
+                elif current_price < df['close'].iloc[-10]:
+                    short_signals += 1
+            
+            williams_r = self.indicators.calculate_williams_r(df['high'], df['low'], df['close'])
+            if not williams_r.isna().all():
+                if williams_r.iloc[-1] > -20:
+                    long_signals += 1
+                elif williams_r.iloc[-1] < -80:
+                    short_signals += 1
+            
+            cci = self.indicators.calculate_cci(df['high'], df['low'], df['close'])
+            if not cci.isna().all():
+                if cci.iloc[-1] > 100:
+                    long_signals += 1
+                elif cci.iloc[-1] < -100:
+                    short_signals += 1
+            
+            mfi = self.indicators.calculate_mfi(df['high'], df['low'], df['close'], df['volume'])
+            if not mfi.isna().all():
+                if mfi.iloc[-1] > 80:
+                    long_signals += 1
+                elif mfi.iloc[-1] < 20:
+                    short_signals += 1
+            
+        except Exception as e:
+            self.logger.error(f"Error in analysis: {e}")
+            return {'score': 0, 'direction': 'neutral', 'vwap_data': None}
+        
+        if long_signals > short_signals:
+            direction = 'long'
+            score = (long_signals / 10) * 100
+        elif short_signals > long_signals:
+            direction = 'short' 
+            score = (short_signals / 10) * 100
+        else:
+            direction = 'neutral'
+            score = 0
+        
+        return {
+            'score': score,
+            'direction': direction,
+            'vwap_data': vwap_data,
+            'long_signals': long_signals,
+            'short_signals': short_signals
+        }
+    
+    def find_trading_opportunities(self, symbols: List[str]):
+        longs = []
+        shorts = []
+        
+        for idx, symbol_info in enumerate(symbols[:230], 1):
+            symbol = symbol_info['symbol']
+            
+            if symbol in self.positions:
+                continue
+                
+            self.logger.info(f"Analyzing {symbol} ({idx}/230)...")
+            
+            df_4h = self.fetch_ohlcv(symbol, '4h', 100)
+            analysis_4h = self.analyze_symbol(df_4h)
+            
+            if analysis_4h['score'] >= 30 and analysis_4h['vwap_data'] is not None:
+                df_15m = self.fetch_ohlcv(symbol, '15m', 100)
+                analysis_15m = self.analyze_symbol(df_15m)
+                
+                if analysis_15m['score'] >= 15 and analysis_15m['vwap_data'] is not None and analysis_4h['direction'] == analysis_15m['direction']:
+                    ticker = self.exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
+                    
+                    trade_candidate = {
+                        'symbol': symbol,
+                        'direction': analysis_4h['direction'],
+                        'score_4h': analysis_4h['score'],
+                        'score_15m': analysis_15m['score'],
+                        'combined_score': (analysis_4h['score'] + analysis_15m['score']) / 2,
+                        'current_price': current_price,
+                        'vwap_data': analysis_15m['vwap_data']
+                    }
+                    
+                    if analysis_4h['direction'] == 'long':
+                        longs.append(trade_candidate)
+                    else:
+                        shorts.append(trade_candidate)
+                    
+                    self.logger.info(f"{symbol} qualified for {analysis_4h['direction'].upper()} (4h: {analysis_4h['score']:.1f}%, 15m: {analysis_15m['score']:.1f}%)")
+        
+        longs.sort(key=lambda x: x['combined_score'], reverse=True)
+        shorts.sort(key=lambda x: x['combined_score'], reverse=True)
+        
+        self.logger.info(f"Found {len(longs)} long candidates, {len(shorts)} short candidates")
+        
+        return longs, shorts
+    
+    def get_current_exposure(self, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"Fetching current exposure (attempt {attempt + 1}/{max_retries})...")
+                
+                positions = None
+                for pos_retry in range(2):
+                    try:
+                        positions = self.exchange.fetch_positions()
+                        break
+                    except Exception as e:
+                        if pos_retry == 0:
+                            self.logger.warning(f"Position fetch failed, retrying: {e}")
+                            import time
+                            time.sleep(2)
+                        else:
+                            raise e
+                
+                open_orders = None
+                for order_retry in range(2):
+                    try:
+                        open_orders = self.exchange.fetch_open_orders()
+                        break
+                    except Exception as e:
+                        if order_retry == 0:
+                            self.logger.warning(f"Orders fetch failed, retrying: {e}")
+                            import time
+                            time.sleep(2)
+                        else:
+                            raise e
+                
+                active_longs = 0
+                active_shorts = 0
+                long_symbols = []
+                short_symbols = []
+                
+                if positions:
+                    for p in positions:
+                        if p.get('contracts', 0) > 0:
+                            if p['side'] == 'long':
+                                active_longs += 1
+                                long_symbols.append(p['symbol'])
+                            else:
+                                active_shorts += 1
+                                short_symbols.append(p['symbol'])
+                
+                pending_long_orders = 0
+                pending_short_orders = 0
+                long_order_symbols = []
+                short_order_symbols = []
+                
+                if open_orders:
+                    for o in open_orders:
+                        if o.get('status') == 'open' and not o.get('reduceOnly', False):
+                            if o['side'] == 'buy':
+                                pending_long_orders += 1
+                                long_order_symbols.append(f"{o['symbol']}(order)")
+                            else:
+                                pending_short_orders += 1
+                                short_order_symbols.append(f"{o['symbol']}(order)")
+                
+                total_longs = active_longs + pending_long_orders
+                total_shorts = active_shorts + pending_short_orders
+                total_exposure = total_longs + total_shorts
+                
+                self.sync_positions_from_exchange(positions, open_orders)
+                
+                self.logger.info(f"Exchange sync complete:")
+                self.logger.info(f"  Long positions: {active_longs}, Long orders: {pending_long_orders} = {total_longs}/10")
+                self.logger.info(f"  Short positions: {active_shorts}, Short orders: {pending_short_orders} = {total_shorts}/10")
+                self.logger.info(f"  Total exposure: {total_exposure}/20")
+                
+                return total_exposure, total_longs, total_shorts, active_longs, active_shorts
+                
+            except Exception as e:
+                self.logger.error(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    self.logger.info(f"Waiting {wait_time}s before retry...")
+                    import time
+                    time.sleep(wait_time)
+                else:
+                    self.logger.error("All attempts failed - returning zero exposure")
+                    return 0, 0, 0, 0, 0
+    
+    def sync_positions_from_exchange(self, positions=None, open_orders=None):
+        try:
+            self.positions.clear()
+            
+            if positions:
+                for pos in positions:
+                    if pos.get('contracts', 0) > 0:
+                        symbol = pos['symbol']
+                        self.positions[symbol] = {
+                            'direction': 'long' if pos['side'] == 'long' else 'short',
+                            'entry_price': pos.get('entryPrice', 0),
+                            'amount': pos.get('contracts', 0),
+                            'type': 'position',
+                            'pnl': pos.get('unrealizedPnl', 0)
+                        }
+            
+            if open_orders:
+                for order in open_orders:
+                    if order.get('status') == 'open' and not order.get('reduceOnly', False):
+                        symbol = order['symbol']
+                        if symbol not in self.positions:
+                            self.positions[symbol] = {
+                                'direction': 'long' if order['side'] == 'buy' else 'short',
+                                'entry_price': order.get('price', 0),
+                                'amount': order.get('amount', 0),
+                                'type': 'order',
+                                'order_id': order.get('id')
+                            }
+            
+            self.logger.info(f"Internal tracking synced: {len(self.positions)} instruments")
+            
+        except Exception as e:
+            self.logger.error(f"Error syncing positions: {e}")
+    
+    async def get_exchange_status(self):
+        try:
+            balance = self.exchange.fetch_balance()
+            return True
+        except Exception as e:
+            self.logger.error(f"Exchange not accessible: {e}")
+            return False
+    
+    async def cancel_all_orders(self):
+        await self.cancel_entry_orders_only()
+    
+    async def place_bracket_order(self, trade_info: Dict, amount: float):
+        symbol = trade_info['symbol']
+        direction = trade_info['direction']
+        vwap_data = trade_info['vwap_data']
+        
+        try:
+            self.exchange.set_leverage(self.leverage, symbol)
+            
+            entry_price = vwap_data['vwap']
+            
+            if direction == 'long':
+                side = 'buy'
+                pos_side = 'long'
+                sl_price = vwap_data['lower_band'] * 0.998
+                risk_distance = entry_price - sl_price
+                tp_price = entry_price + (2 * risk_distance)
+            else:
+                side = 'sell'
+                pos_side = 'short'
+                sl_price = vwap_data['upper_band'] * 1.002
+                risk_distance = sl_price - entry_price
+                tp_price = entry_price - (2 * risk_distance)
+            
+            params = {
+                'posSide': pos_side,
+                'tdMode': 'cross',
+                'takeProfit': {
+                    'triggerPrice': tp_price,
+                    'price': tp_price,
+                    'triggerPriceType': 'last',
+                },
+                'stopLoss': {
+                    'triggerPrice': sl_price,
+                    'price': sl_price,
+                    'triggerPriceType': 'last',
+                }
+            }
+            
+            order = self.exchange.create_order(
+                symbol=symbol,
+                type='limit',
+                side=side,
+                amount=amount,
+                price=entry_price,
+                params=params
+            )
+            
+            self.positions[symbol] = {
+                'direction': direction,
+                'entry_price': entry_price,
+                'amount': amount,
+                'tp_price': tp_price,
+                'sl_price': sl_price,
+                'order_id': order['id']
+            }
+            
+            risk_pct = (abs(entry_price - sl_price) / entry_price) * 100
+            reward_pct = (abs(tp_price - entry_price) / entry_price) * 100
+            
+            self.logger.info(f"{direction.upper()} bracket order placed for {symbol}")
+            self.logger.info(f"  Entry: ${entry_price:.6f} | SL: ${sl_price:.6f} | TP: ${tp_price:.6f}")
+            self.logger.info(f"  Risk: {risk_pct:.2f}% | Reward: {reward_pct:.2f}% | R:R = 1:{reward_pct/risk_pct:.1f}")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to place bracket order for {symbol}: {e}")
+            try:
+                simple_order = self.exchange.create_order(
+                    symbol=symbol,
+                    type='limit',
+                    side=side,
+                    amount=amount,
+                    price=entry_price,
+                    params={'posSide': pos_side}
+                )
+                
+                self.positions[symbol] = {
+                    'direction': direction,
+                    'entry_price': entry_price,
+                    'amount': amount,
+                    'tp_price': tp_price,
+                    'sl_price': sl_price,
+                    'order_id': simple_order['id']
+                }
+                
+                self.logger.info(f"Simple {direction.upper()} limit order placed for {symbol}")
+                return True
+                
+            except Exception as e2:
+                self.logger.error(f"Failed to place any order for {symbol}: {e2}")
+                return False
+    
+    async def run_trading_cycle(self):
+        try:
+            self.logger.info("=" * 60)
+            self.logger.info("Starting trading cycle - VWAP Deviation Bands SL")
+            self.logger.info("MAX 10 LONGS + 10 SHORTS (20 TOTAL)")
+            self.logger.info("=" * 60)
+            
+            if not await self.get_exchange_status():
+                self.logger.error("Exchange not accessible - skipping cycle")
+                self.email_reporter.send_error_report(
+                    "Exchange connectivity lost",
+                    "Unable to connect to OKX exchange"
+                )
+                return
+            
+            current_balance = self.get_available_margin()
+            
+            if not self.session_active:
+                self.start_new_session(current_balance)
+            
+            self.session_tracker.update_balance(current_balance)
+            
+            # Send 12-hour periodic report
+            self.email_reporter.send_periodic_report(self)
+            
+            if datetime.now() - self.order_reset_time > timedelta(hours=1):
+                self.logger.info("1 hour passed - resetting entry orders only")
+                await self.cancel_entry_orders_only()
+                self.order_reset_time = datetime.now()
+                await asyncio.sleep(5)
+            
+            total_exposure, total_longs, total_shorts, active_longs, active_shorts = self.get_current_exposure()
+            
+            if total_exposure == 0 and len(self.positions) > 0:
+                self.logger.warning("Exposure mismatch detected - waiting and retrying...")
+                await asyncio.sleep(10)
+                total_exposure, total_longs, total_shorts, active_longs, active_shorts = self.get_current_exposure()
+            
+            if total_exposure >= self.max_total_positions:
+                self.logger.info("At maximum capacity (20 total) - waiting for fills or exits")
+                return
+            
+            # Calculate remaining slots for each side
+            remaining_long_slots = self.max_long_positions - total_longs
+            remaining_short_slots = self.max_short_positions - total_shorts
+            
+            if remaining_long_slots <= 0 and remaining_short_slots <= 0:
+                self.logger.info("Both sides at maximum (10 longs, 10 shorts) - waiting")
+                return
+            
+            available_margin = self.get_available_margin()
+            if available_margin < 10:
+                self.logger.error(f"Insufficient margin: ${available_margin:.2f}")
+                return
+            
+            try:
+                balance_info = self.exchange.fetch_balance()
+                total_account_balance = balance_info.get('USDT', {}).get('total', available_margin)
+                if total_account_balance <= 0:
+                    total_account_balance = available_margin * 1.25
+            except:
+                total_account_balance = available_margin * 1.25
+            
+            self.logger.info(f"Available: ${available_margin:.2f}, Total account: ${total_account_balance:.2f}")
+            self.logger.info(f"Session balance: ${self.session_start_balance:.2f} -> ${current_balance:.2f}")
+            profit_pct = ((current_balance - self.session_start_balance) / self.session_start_balance) * 100 if self.session_start_balance > 0 else 0
+            self.logger.info(f"Session profit: {profit_pct:.3f}%")
+            self.logger.info(f"Remaining slots: {remaining_long_slots} longs, {remaining_short_slots} shorts")
+            
+            symbols = self.get_futures_symbols()
+            if not symbols:
+                return
+                
+            longs, shorts = self.find_trading_opportunities(symbols)
+            
+            if not longs and not shorts:
+                self.logger.info("No opportunities found")
+                return
+            
+            # Select trades based on available slots for each side
+            selected_longs = longs[:remaining_long_slots] if remaining_long_slots > 0 else []
+            selected_shorts = shorts[:remaining_short_slots] if remaining_short_slots > 0 else []
+            
+            all_selected_trades = selected_longs + selected_shorts
+            
+            if not all_selected_trades:
+                return
+            
+            self.logger.info(f"Selected {len(selected_longs)} longs and {len(selected_shorts)} shorts")
+            
+            total_margin_to_use = available_margin * 0.8
+            successful_trades = 0
+            
+            for i, trade in enumerate(all_selected_trades, 1):
+                self.logger.info(f"Placing order {i}/{len(all_selected_trades)}: {trade['symbol']} {trade['direction'].upper()}")
+                
+                amount, margin_used = self.calculate_equal_position_size(
+                    trade['symbol'], 
+                    trade['vwap_data']['vwap'], 
+                    total_margin_to_use, 
+                    len(all_selected_trades),
+                    total_account_balance
+                )
+                
+                if amount > 0:
+                    success = await self.place_bracket_order(trade, amount)
+                    if success:
+                        successful_trades += 1
+                    await asyncio.sleep(1)
+            
+            self.logger.info(f"Successfully placed {successful_trades}/{len(all_selected_trades)} orders")
+            
+            if successful_trades > 0:
+                await asyncio.sleep(3)
+                final_exposure, final_longs, final_shorts, _, _ = self.get_current_exposure()
+                self.logger.info(f"Post-order sync: {final_longs} longs, {final_shorts} shorts ({final_exposure}/20 total)")
+            
+        except Exception as e:
+            self.logger.error(f"Error in trading cycle: {e}")
+            import traceback
+            error_traceback = traceback.format_exc()
+            traceback.print_exc()
+            
+            # Send error email
+            self.email_reporter.send_error_report(str(e), error_traceback)
+
+async def main():
+    # Email configuration - using your credentials
+    email_reporter = EmailReporter()
+    
+    # OKX API credentials
+    API_KEY = "5e22e924-0001-4675-b235-632c467c818e"
+    API_SECRET = "811817EFE46121411C683AEB142B14CE"
+    PASSPHRASE = "#Dinywa15"
+    TEST_MODE = False
+    
+    print("""
+    ╔═══════════════════════════════════════════════╗
+    ║   OKX Futures Bot - VWAP Deviation Bands     ║
+    ║   • Stop Loss at ±2σ VWAP bands              ║
+    ║   • Take Profit at 2x risk distance          ║
+    ║   • No manual monitoring - pure limit orders ║
+    ║   • MAX: 10 Long + 10 Short (20 total)      ║
+    ║   • 1-hour order reset cycle                 ║
+    ║   • 12-hour periodic email reports           ║
+    ║   • Email reports on errors                  ║
+    ║   • TP/SL preserved during order resets      ║
+    ╚═══════════════════════════════════════════════╝
+    """)
+    
+    bot = OKXFuturesBot(API_KEY, API_SECRET, PASSPHRASE, email_reporter, TEST_MODE)
+    
+    # Test connection
+    try:
+        margin = bot.get_available_margin()
+        logger.info(f"Connected successfully. Available: ${margin:.2f}")
+        logger.info(f"Email reports will be sent to: {email_reporter.receiver}")
+        logger.info(f"12-hour reports enabled, error notifications enabled")
+    except Exception as e:
+        logger.error(f"Connection failed: {e}")
+        email_reporter.send_error_report(
+            "Bot startup failed",
+            f"Failed to connect to OKX: {str(e)}"
+        )
+        return
+    
+    while True:
+        try:
+            await bot.run_trading_cycle()
+            logger.info("Waiting 60 seconds before next cycle...")
+            await asyncio.sleep(60)
+            
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            if bot.session_active:
+                final_balance = bot.get_available_margin()
+                bot.session_tracker.end_session(final_balance, "manual_shutdown")
+            break
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            import traceback
+            error_traceback = traceback.format_exc()
+            bot.email_reporter.send_error_report(str(e), error_traceback)
+            await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    asyncio.run(main())
