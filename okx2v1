@@ -557,54 +557,195 @@ class OKXFuturesBot:
             self.logger.error(f"Error ensuring TP/SL for position: {e}")
     
     async def cancel_entry_orders_only(self):
-        """Cancel only entry orders, preserve TP/SL orders for existing positions"""
+        """Cancel only entry orders one by one, preserve TP/SL orders for existing positions"""
         try:
             # Get all positions first
             positions = self.exchange.fetch_positions()
-            position_symbols = set()
+            position_symbols = {}
             
             for pos in positions:
                 if pos.get('contracts', 0) > 0:
-                    position_symbols.add(pos['symbol'])
+                    symbol = pos['symbol']
+                    position_symbols[symbol] = {
+                        'side': pos['side'],
+                        'size': pos.get('contracts', 0),
+                        'entry_price': pos.get('entryPrice', 0)
+                    }
+            
+            self.logger.info(f"Found {len(position_symbols)} active positions to protect")
             
             # Get all open orders
             open_orders = self.exchange.fetch_open_orders()
-            cancelled_count = 0
+            entry_orders_cancelled = 0
+            tpsl_orders_preserved = 0
             
             for order in open_orders:
-                if order['status'] == 'open':
-                    symbol = order['symbol']
-                    is_reduce_only = order.get('reduceOnly', False)
+                if order['status'] != 'open':
+                    continue
+                
+                symbol = order['symbol']
+                order_side = order['side']
+                order_type = order.get('type', '').lower()
+                is_reduce_only = order.get('reduceOnly', False)
+                order_id = order.get('id')
+                
+                # Check if this is a TP/SL order for an existing position
+                if symbol in position_symbols and is_reduce_only:
+                    pos_info = position_symbols[symbol]
                     
-                    # If this order is for an existing position and is reduce-only, skip it (it's TP/SL)
-                    if symbol in position_symbols and is_reduce_only:
-                        self.logger.info(f"Preserving TP/SL order for {symbol}")
+                    # For long positions, TP/SL are sell orders
+                    # For short positions, TP/SL are buy orders
+                    is_tpsl_for_position = (
+                        (pos_info['side'] == 'long' and order_side == 'sell') or
+                        (pos_info['side'] == 'short' and order_side == 'buy')
+                    )
+                    
+                    if is_tpsl_for_position:
+                        self.logger.info(f"✓ PRESERVING TP/SL: {symbol} {order_side} (reduceOnly) for {pos_info['side']} position")
+                        tpsl_orders_preserved += 1
                         continue
+                
+                # This is an entry order - cancel it
+                try:
+                    self.exchange.cancel_order(order_id, symbol)
+                    entry_orders_cancelled += 1
+                    self.logger.info(f"✗ CANCELLED entry order: {symbol} {order_side} {order_type}")
+                    await asyncio.sleep(0.5)  # Small delay between cancellations
+                except Exception as e:
+                    self.logger.error(f"Failed to cancel order {order_id} for {symbol}: {e}")
+            
+            self.logger.info(f"Order reset complete: Cancelled {entry_orders_cancelled} entry orders, Preserved {tpsl_orders_preserved} TP/SL orders")
+            
+            # Now ensure all positions have TP/SL
+            if position_symbols:
+                self.logger.info("Verifying TP/SL coverage for all positions...")
+                await asyncio.sleep(2)  # Wait for cancellations to fully process
+                
+                for symbol, pos_info in position_symbols.items():
+                    # Fetch updated orders for this symbol
+                    symbol_orders = self.exchange.fetch_open_orders(symbol)
                     
-                    # Cancel entry orders (non-reduce-only or for symbols without positions)
-                    try:
-                        self.exchange.cancel_order(order['id'], symbol)
-                        cancelled_count += 1
-                        self.logger.info(f"Cancelled entry order: {symbol} {order['side']}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to cancel order {order['id']}: {e}")
-            
-            if cancelled_count > 0:
-                self.logger.info(f"Cancelled {cancelled_count} entry orders (preserved TP/SL)")
-            
-            # Ensure all positions have TP/SL
-            for pos in positions:
-                if pos.get('contracts', 0) > 0:
-                    await self.ensure_tp_sl_for_position(pos)
+                    has_tp = False
+                    has_sl = False
+                    
+                    for order in symbol_orders:
+                        if order.get('reduceOnly') and order.get('status') == 'open':
+                            order_side = order['side']
+                            order_type = order.get('type', '').lower()
+                            stop_price = order.get('stopPrice')
+                            order_price = order.get('price', 0)
+                            
+                            # Check if it's for this position side
+                            is_for_this_position = (
+                                (pos_info['side'] == 'long' and order_side == 'sell') or
+                                (pos_info['side'] == 'short' and order_side == 'buy')
+                            )
+                            
+                            if not is_for_this_position:
+                                continue
+                            
+                            # Determine if TP or SL based on price relative to entry
+                            entry = pos_info['entry_price']
+                            
+                            if pos_info['side'] == 'long':
+                                # For longs: TP is above entry, SL is below entry
+                                if order_price > entry or (stop_price and stop_price > entry):
+                                    has_tp = True
+                                    self.logger.info(f"  {symbol}: TP confirmed at ${order_price:.6f}")
+                                elif order_price < entry or (stop_price and stop_price < entry):
+                                    has_sl = True
+                                    self.logger.info(f"  {symbol}: SL confirmed at ${stop_price if stop_price else order_price:.6f}")
+                            else:
+                                # For shorts: TP is below entry, SL is above entry
+                                if order_price < entry or (stop_price and stop_price < entry):
+                                    has_tp = True
+                                    self.logger.info(f"  {symbol}: TP confirmed at ${order_price:.6f}")
+                                elif order_price > entry or (stop_price and stop_price > entry):
+                                    has_sl = True
+                                    self.logger.info(f"  {symbol}: SL confirmed at ${stop_price if stop_price else order_price:.6f}")
+                    
+                    # Add missing TP/SL
+                    if not has_tp or not has_sl:
+                        self.logger.warning(f"⚠ {symbol} missing {'TP' if not has_tp else ''}{' and ' if not has_tp and not has_sl else ''}{'SL' if not has_sl else ''}")
+                        await self.add_missing_tpsl(symbol, pos_info, has_tp, has_sl)
             
         except Exception as e:
-            self.logger.error(f"Error cancelling entry orders: {e}")
+            self.logger.error(f"Error in cancel_entry_orders_only: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def add_missing_tpsl(self, symbol, pos_info, has_tp, has_sl):
+        """Add missing TP/SL orders for a position"""
+        try:
+            entry_price = pos_info['entry_price']
+            size = pos_info['size']
+            side = pos_info['side']
+            
+            if entry_price <= 0 or size <= 0:
+                self.logger.error(f"Invalid position data for {symbol}")
+                return
+            
+            # Calculate TP/SL prices (2% risk, 4% reward as default)
+            risk_pct = 0.02
+            
+            if side == 'long':
+                sl_price = entry_price * (1 - risk_pct)
+                tp_price = entry_price * (1 + (risk_pct * 2))
+                close_side = 'sell'
+            else:
+                sl_price = entry_price * (1 + risk_pct)
+                tp_price = entry_price * (1 - (risk_pct * 2))
+                close_side = 'buy'
+            
+            # Add TP if missing
+            if not has_tp:
+                try:
+                    tp_order = self.exchange.create_order(
+                        symbol=symbol,
+                        type='limit',
+                        side=close_side,
+                        amount=size,
+                        price=tp_price,
+                        params={
+                            'posSide': side,
+                            'tdMode': 'cross',
+                            'reduceOnly': True
+                        }
+                    )
+                    self.logger.info(f"✓ Added TP for {symbol} at ${tp_price:.6f}")
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    self.logger.error(f"Failed to add TP for {symbol}: {e}")
+            
+            # Add SL if missing
+            if not has_sl:
+                try:
+                    sl_order = self.exchange.create_order(
+                        symbol=symbol,
+                        type='stop_market',
+                        side=close_side,
+                        amount=size,
+                        params={
+                            'posSide': side,
+                            'tdMode': 'cross',
+                            'stopPrice': sl_price,
+                            'triggerPrice': sl_price,
+                            'reduceOnly': True
+                        }
+                    )
+                    self.logger.info(f"✓ Added SL for {symbol} at ${sl_price:.6f}")
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    self.logger.error(f"Failed to add SL for {symbol}: {e}")
+        
+        except Exception as e:
+            self.logger.error(f"Error adding missing TP/SL for {symbol}: {e}")
     
     async def close_all_positions_and_orders(self, reason="profit_target"):
         try:
             self.logger.info(f"Closing all positions and orders - Reason: {reason}")
             
-            # Cancel all open orders
+            # Cancel all open orders one by one
             open_orders = self.exchange.fetch_open_orders()
             cancelled_count = 0
             
@@ -614,10 +755,11 @@ class OKXFuturesBot:
                         self.exchange.cancel_order(order['id'], order['symbol'])
                         cancelled_count += 1
                         self.logger.info(f"Cancelled order: {order['symbol']} {order['side']}")
+                        await asyncio.sleep(0.3)  # Small delay between cancellations
                     except Exception as e:
                         self.logger.error(f"Failed to cancel order {order['id']}: {e}")
             
-            # Close all positions at market price
+            # Close all positions at market price one by one
             positions = self.exchange.fetch_positions()
             closed_count = 0
             
@@ -663,6 +805,7 @@ class OKXFuturesBot:
                         )
                         
                         self.logger.info(f"Closed position: {symbol} {pos['side']} - PnL: ${pnl:.2f} ({pnl_percentage:.2f}%)")
+                        await asyncio.sleep(0.5)  # Delay between closing positions
                         
                     except Exception as e:
                         self.logger.error(f"Failed to close position {symbol}: {e}")
