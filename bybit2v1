@@ -464,14 +464,15 @@ class BybitBot:
             logger.error(f"Alien detection error: {e}")
     
     async def check_add_tpsl(self):
-        """Check positions without TP/SL and add them"""
-        if (datetime.now() - self.last_tpsl_check).total_seconds() < 60:
+        """Check positions without TP/SL and add them - Enhanced version"""
+        if (datetime.now() - self.last_tpsl_check).total_seconds() < 30:  # Check more frequently (30s)
             return
         
         self.last_tpsl_check = datetime.now()
         
         try:
             positions = self.exchange.fetch_positions()
+            fixed_count = 0
             
             for pos in positions:
                 if float(pos.get('contracts', 0)) <= 0:
@@ -488,7 +489,7 @@ class BybitBot:
                 has_sl = pos.get('stopLoss') and float(pos.get('stopLoss', 0)) > 0
                 
                 if not has_tp or not has_sl:
-                    logger.warning(f"⚠ {sym} missing TP/SL, adding...")
+                    logger.warning(f"⚠ {sym} missing TP/SL - Adding now...")
                     
                     entry = float(pos.get('entryPrice', 0))
                     direction = 'long' if pos['side'] == 'long' else 'short'
@@ -516,9 +517,50 @@ class BybitBot:
                                 'takeProfit': str(tp)
                             }
                             self.exchange.private_post_v5_position_trading_stop(params)
+                            fixed_count += 1
                             logger.info(f"✓ Added TP/SL to {sym}: SL ${sl:.6f}, TP ${tp:.6f}")
+                            
+                            # Update local tracking
+                            if sym in self.positions:
+                                self.positions[sym]['tp'] = tp
+                                self.positions[sym]['sl'] = sl
+                            
+                            await asyncio.sleep(0.5)  # Rate limit protection
+                            
                         except Exception as e:
                             logger.error(f"Failed to add TP/SL to {sym}: {e}")
+                    else:
+                        logger.warning(f"⚠ Could not get VWAP data for {sym}, using fallback TP/SL")
+                        # Fallback: 2% SL, 4% TP
+                        if direction == 'long':
+                            sl = entry * 0.98
+                            tp = entry * 1.04
+                        else:
+                            sl = entry * 1.02
+                            tp = entry * 0.96
+                        
+                        try:
+                            params = {
+                                'symbol': sym,
+                                'positionIdx': position_idx,
+                                'stopLoss': str(sl),
+                                'takeProfit': str(tp)
+                            }
+                            self.exchange.private_post_v5_position_trading_stop(params)
+                            fixed_count += 1
+                            logger.info(f"✓ Added fallback TP/SL to {sym}: SL ${sl:.6f}, TP ${tp:.6f}")
+                            
+                            if sym in self.positions:
+                                self.positions[sym]['tp'] = tp
+                                self.positions[sym]['sl'] = sl
+                            
+                            await asyncio.sleep(0.5)
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to add fallback TP/SL to {sym}: {e}")
+            
+            if fixed_count > 0:
+                logger.info(f"✓ Fixed {fixed_count} positions missing TP/SL")
         
         except Exception as e:
             logger.error(f"TP/SL check error: {e}")
@@ -643,6 +685,29 @@ class BybitBot:
             self.known_symbols.add(sym)
             
             logger.info(f"✓ {direction.upper()} {sym}: Entry ${entry:.6f}, SL ${sl:.6f}, TP ${tp:.6f}")
+            
+            # Verify TP/SL were set correctly (wait for order to fill first)
+            await asyncio.sleep(2)
+            try:
+                positions = self.exchange.fetch_positions([sym])
+                for p in positions:
+                    if float(p.get('contracts', 0)) > 0:
+                        has_tp = p.get('takeProfit') and float(p.get('takeProfit', 0)) > 0
+                        has_sl = p.get('stopLoss') and float(p.get('stopLoss', 0)) > 0
+                        
+                        if not has_tp or not has_sl:
+                            logger.warning(f"⚠ TP/SL not set on {sym}, adding manually...")
+                            params = {
+                                'symbol': sym,
+                                'positionIdx': idx,
+                                'stopLoss': str(sl),
+                                'takeProfit': str(tp)
+                            }
+                            self.exchange.private_post_v5_position_trading_stop(params)
+                            logger.info(f"✓ Manually added TP/SL to {sym}")
+            except Exception as e:
+                logger.warning(f"Could not verify TP/SL for {sym}: {e}")
+            
             return True
         except Exception as e:
             logger.error(f"Order failed {sym}: {e}")
@@ -738,16 +803,44 @@ class BybitBot:
                 
                 self.notifier.send_periodic_report(stats, self.tracker.trades, self.tracker.alien_trades)
             
-            # 1-hour order reset
+            # 1-hour order reset - ONLY cancel unfilled limit entry orders
             if datetime.now() - self.order_reset > timedelta(hours=1):
-                logger.info("1-hour reset")
-                orders = self.exchange.fetch_open_orders()
-                for o in orders:
-                    if o['status'] == 'open' and o['symbol'] not in self.alien_symbols:
-                        try:
-                            self.exchange.cancel_order(o['id'], o['symbol'])
-                        except:
-                            pass
+                logger.info("1-hour reset: Cancelling unfilled limit orders...")
+                try:
+                    orders = self.exchange.fetch_open_orders()
+                    cancelled_count = 0
+                    
+                    for o in orders:
+                        if o['status'] == 'open' and o['symbol'] not in self.alien_symbols:
+                            # CRITICAL: Only cancel limit orders (entry orders)
+                            # Do NOT cancel stop orders (TP/SL)
+                            order_type = o.get('type', '').lower()
+                            
+                            if order_type == 'limit':
+                                try:
+                                    self.exchange.cancel_order(o['id'], o['symbol'])
+                                    cancelled_count += 1
+                                    logger.info(f"✗ Cancelled unfilled limit: {o['symbol']}")
+                                    
+                                    # Remove from tracking if order wasn't filled
+                                    if o['symbol'] in self.positions:
+                                        del self.positions[o['symbol']]
+                                    if o['symbol'] in self.known_symbols:
+                                        self.known_symbols.remove(o['symbol'])
+                                    
+                                    await asyncio.sleep(0.5)  # Rate limit protection
+                                except Exception as e:
+                                    logger.error(f"Failed to cancel {o['symbol']}: {e}")
+                    
+                    logger.info(f"Reset complete: Cancelled {cancelled_count} unfilled orders")
+                    
+                    # After cancelling, check ALL positions for missing TP/SL
+                    logger.info("Checking all positions for missing TP/SL...")
+                    await self.check_add_tpsl()
+                    
+                except Exception as e:
+                    logger.error(f"Order reset error: {e}")
+                
                 self.order_reset = datetime.now()
                 await asyncio.sleep(5)
             
